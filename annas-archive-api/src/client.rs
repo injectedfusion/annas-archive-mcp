@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use reqwest::{Client, cookie::Jar};
+use tokio::sync::Mutex;
 
 use crate::error::Error;
 use crate::scraper::parse_search_results;
@@ -8,42 +12,210 @@ use crate::types::{
     DownloadInfo, DownloadSource, Identifiers, IpfsInfo, ItemDetails, SearchOptions, SearchResponse,
 };
 
-const DOMAINS: &[&str] = &["annas-archive.org", "annas-archive.se", "annas-archive.li"];
+const DEFAULT_DOMAINS: &[&str] = &[
+    "annas-archive.pk",
+    "annas-archive.gd",
+    "annas-archive.gl",
+];
+
+const NOT_AUTHENTICATED: usize = usize::MAX;
+const MAX_AUTH_FAILURES_BEFORE_BLACKLIST: u32 = 5;
+const MAX_BACKOFF_SECS: u64 = 60;
+
+struct DomainState {
+    consecutive_failures: u32,
+    last_failure: Option<Instant>,
+    blacklisted: bool,
+    retry_after: Option<Duration>,
+}
+
+impl DomainState {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            last_failure: None,
+            blacklisted: false,
+            retry_after: None,
+        }
+    }
+
+    fn record_failure(&mut self, retry_after: Option<Duration>) {
+        self.consecutive_failures += 1;
+        self.last_failure = Some(Instant::now());
+        self.retry_after = retry_after;
+        if self.consecutive_failures >= MAX_AUTH_FAILURES_BEFORE_BLACKLIST {
+            self.blacklisted = true;
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_failure = None;
+        self.retry_after = None;
+    }
+
+    fn backoff_remaining(&self) -> Option<Duration> {
+        let last = self.last_failure?;
+        let elapsed = last.elapsed();
+
+        if let Some(retry_after) = self.retry_after {
+            return retry_after.checked_sub(elapsed);
+        }
+
+        let backoff_secs = (1u64 << self.consecutive_failures.min(6)).min(MAX_BACKOFF_SECS);
+        let backoff = Duration::from_secs(backoff_secs);
+        backoff.checked_sub(elapsed)
+    }
+}
+
+fn resolve_domains(domains: Option<Vec<String>>) -> Vec<String> {
+    if let Some(d) = domains {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    if let Ok(env_val) = std::env::var("ANNAS_ARCHIVE_DOMAINS") {
+        let parsed: Vec<String> = env_val
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+    DEFAULT_DOMAINS.iter().map(|s| s.to_string()).collect()
+}
+
+fn validate_api_key(key: &str) {
+    let trimmed = key.trim();
+    assert!(
+        !trimmed.is_empty(),
+        "ANNAS_ARCHIVE_API_KEY is empty"
+    );
+    assert!(
+        trimmed.len() >= 5 && trimmed.len() <= 200,
+        "ANNAS_ARCHIVE_API_KEY length {} is outside valid range 5-200",
+        trimmed.len()
+    );
+    assert!(
+        trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "ANNAS_ARCHIVE_API_KEY contains invalid characters (only alphanumeric, hyphens, underscores allowed)"
+    );
+}
 
 pub struct AnnasArchiveClient {
     client: Client,
     api_key: Option<String>,
-    #[allow(dead_code)] // Used by cookie_provider, but not directly accessed
+    domains: Vec<String>,
+    #[allow(dead_code)]
     cookie_jar: Arc<Jar>,
-    authenticated: std::sync::atomic::AtomicBool,
+    authenticated_domain_idx: AtomicUsize,
+    domain_states: Mutex<HashMap<String, DomainState>>,
 }
 
 impl AnnasArchiveClient {
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(api_key: Option<String>, domains: Option<Vec<String>>) -> Self {
+        if let Some(ref key) = api_key {
+            validate_api_key(key);
+        }
+
         let cookie_jar = Arc::new(Jar::default());
 
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
             .cookie_provider(cookie_jar.clone())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("Failed to create HTTP client");
+
+        let resolved_domains = resolve_domains(domains);
+        let domain_states: HashMap<String, DomainState> = resolved_domains
+            .iter()
+            .map(|d| (d.clone(), DomainState::new()))
+            .collect();
 
         Self {
             client,
             api_key,
+            domains: resolved_domains,
             cookie_jar,
-            authenticated: std::sync::atomic::AtomicBool::new(false),
+            authenticated_domain_idx: AtomicUsize::new(NOT_AUTHENTICATED),
+            domain_states: Mutex::new(domain_states),
         }
     }
 
-    /// Authenticate with Anna's Archive using the secret key.
-    /// This sets the aa_account_id2 cookie needed for API access.
+    fn is_allowed_url(&self, url: &str) -> bool {
+        if !url.starts_with("https://") {
+            return false;
+        }
+        let host = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|host_port| host_port.split(':').next())
+            .unwrap_or("");
+        self.domains.iter().any(|d| d == host)
+    }
+
+    fn authenticated_domain(&self) -> Option<&str> {
+        let idx = self.authenticated_domain_idx.load(Ordering::SeqCst);
+        if idx == NOT_AUTHENTICATED {
+            return None;
+        }
+        self.domains.get(idx).map(|s| s.as_str())
+    }
+
+    async fn check_domain_available(&self, domain: &str) -> Result<(), Error> {
+        let states = self.domain_states.lock().await;
+        if let Some(state) = states.get(domain) {
+            if state.blacklisted {
+                return Err(Error::DomainBlacklisted(domain.to_string()));
+            }
+            if let Some(remaining) = state.backoff_remaining() {
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| Duration::from_secs(secs.min(MAX_BACKOFF_SECS)))
+    }
+
+    async fn record_auth_failure(&self, domain: &str, response: Option<&reqwest::Response>) {
+        let retry_after = response.and_then(Self::parse_retry_after);
+        let mut states = self.domain_states.lock().await;
+        if let Some(state) = states.get_mut(domain) {
+            state.record_failure(retry_after);
+        }
+    }
+
+    async fn record_auth_success(&self, domain: &str) {
+        let mut states = self.domain_states.lock().await;
+        if let Some(state) = states.get_mut(domain) {
+            state.record_success();
+        }
+    }
+
     async fn authenticate(&self) -> Result<(), Error> {
         let api_key = self.api_key.as_ref().ok_or(Error::MissingApiKey)?;
 
-        // Try each domain for authentication
-        for domain in DOMAINS {
+        for (idx, domain) in self.domains.iter().enumerate() {
+            if let Err(e) = self.check_domain_available(domain).await {
+                if matches!(e, Error::DomainBlacklisted(_)) {
+                    continue;
+                }
+            }
+
             let url = format!("https://{domain}/account/");
+            if !self.is_allowed_url(&url) {
+                continue;
+            }
 
             let response = self
                 .client
@@ -54,16 +226,27 @@ impl AnnasArchiveClient {
 
             match response {
                 Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
-                    self.authenticated
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.authenticated_domain_idx.store(idx, Ordering::SeqCst);
+                    self.record_auth_success(domain).await;
                     return Ok(());
+                }
+                Ok(resp) if resp.status().as_u16() == 403 || resp.status().as_u16() == 429 => {
+                    self.record_auth_failure(domain, Some(&resp)).await;
+                    continue;
                 }
                 Ok(resp) if resp.status().is_client_error() => {
                     return Err(Error::Api {
                         message: "Invalid secret key".to_string(),
                     });
                 }
-                _ => continue, // Try next domain
+                Ok(resp) => {
+                    self.record_auth_failure(domain, Some(&resp)).await;
+                    continue;
+                }
+                Err(_) => {
+                    self.record_auth_failure(domain, None).await;
+                    continue;
+                }
             }
         }
 
@@ -73,7 +256,7 @@ impl AnnasArchiveClient {
     }
 
     async fn ensure_authenticated(&self) -> Result<(), Error> {
-        if !self.authenticated.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.authenticated_domain_idx.load(Ordering::SeqCst) == NOT_AUTHENTICATED {
             self.authenticate().await?;
         }
         Ok(())
@@ -82,27 +265,39 @@ impl AnnasArchiveClient {
     async fn fetch_with_failover(&self, path: &str) -> Result<String, Error> {
         let mut last_error = None;
 
-        for domain in DOMAINS {
+        for domain in &self.domains {
+            if self.check_domain_available(domain).await.is_err() {
+                continue;
+            }
+
             let url = format!("https://{domain}{path}");
+            if !self.is_allowed_url(&url) {
+                continue;
+            }
 
             match self.client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        return response.text().await.map_err(Error::Network);
+                        return response.text().await.map_err(Error::from_reqwest);
+                    } else if response.status().as_u16() == 403
+                        || response.status().as_u16() == 429
+                    {
+                        self.record_auth_failure(domain, Some(&response)).await;
+                        last_error = Some(Error::Http {
+                            status: response.status().as_u16(),
+                        });
                     } else if response.status().is_client_error() {
-                        // Client errors (4xx) won't be fixed by trying another domain
                         return Err(Error::Http {
                             status: response.status().as_u16(),
                         });
+                    } else {
+                        last_error = Some(Error::Http {
+                            status: response.status().as_u16(),
+                        });
                     }
-                    // Server error - try next domain
-                    last_error = Some(Error::Http {
-                        status: response.status().as_u16(),
-                    });
                 }
                 Err(e) => {
-                    // Connection error - try next domain
-                    last_error = Some(Error::Network(e));
+                    last_error = Some(Error::from_reqwest(e));
                 }
             }
         }
@@ -127,46 +322,74 @@ impl AnnasArchiveClient {
         })
     }
 
-    /// Get detailed metadata for an item. Requires API key (secret key).
     pub async fn get_details(&self, md5: &str) -> Result<ItemDetails, Error> {
         self.ensure_authenticated().await?;
 
         let path = format!("/db/aarecord_elasticsearch/md5:{md5}.json");
 
-        let mut last_error = None;
-
-        for domain in DOMAINS {
+        if let Some(domain) = self.authenticated_domain() {
             let url = format!("https://{domain}{path}");
-
-            match self.client.get(&url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let json_str = response.text().await.map_err(Error::Network)?;
+            if self.is_allowed_url(&url) {
+                match self.client.get(&url).send().await {
+                    Ok(response) if response.status().is_success() => {
+                        let json_str = response.text().await.map_err(Error::from_reqwest)?;
                         return parse_json_details(&json_str, md5);
-                    } else if response.status().is_client_error() {
-                        let status = response.status().as_u16();
-                        if status == 403 {
-                            // Re-authenticate and retry once
-                            self.authenticated
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                            self.authenticate().await?;
+                    }
+                    Ok(response)
+                        if response.status().as_u16() == 403
+                            || response.status().as_u16() == 429 =>
+                    {
+                        self.record_auth_failure(domain, Some(&response)).await;
+                        self.authenticated_domain_idx
+                            .store(NOT_AUTHENTICATED, Ordering::SeqCst);
+                        self.authenticate().await?;
 
-                            // Retry request
-                            if let Ok(resp) = self.client.get(&url).send().await
-                                && resp.status().is_success()
-                            {
-                                let json_str = resp.text().await.map_err(Error::Network)?;
-                                return parse_json_details(&json_str, md5);
+                        if let Some(domain) = self.authenticated_domain() {
+                            let url = format!("https://{domain}{path}");
+                            if self.is_allowed_url(&url) {
+                                if let Ok(resp) = self.client.get(&url).send().await
+                                    && resp.status().is_success()
+                                {
+                                    let json_str =
+                                        resp.text().await.map_err(Error::from_reqwest)?;
+                                    return parse_json_details(&json_str, md5);
+                                }
                             }
                         }
-                        return Err(Error::Http { status });
                     }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut last_error = None;
+        for domain in &self.domains {
+            if self.check_domain_available(domain).await.is_err() {
+                continue;
+            }
+
+            let url = format!("https://{domain}{path}");
+            if !self.is_allowed_url(&url) {
+                continue;
+            }
+
+            match self.client.get(&url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    let json_str = response.text().await.map_err(Error::from_reqwest)?;
+                    return parse_json_details(&json_str, md5);
+                }
+                Ok(response) if response.status().is_client_error() => {
+                    return Err(Error::Http {
+                        status: response.status().as_u16(),
+                    });
+                }
+                Ok(response) => {
                     last_error = Some(Error::Http {
                         status: response.status().as_u16(),
                     });
                 }
                 Err(e) => {
-                    last_error = Some(Error::Network(e));
+                    last_error = Some(Error::from_reqwest(e));
                 }
             }
         }
@@ -187,79 +410,68 @@ impl AnnasArchiveClient {
         let path_idx = path_index.unwrap_or(0);
         let domain_idx = domain_index.unwrap_or(0);
 
-        // Try each domain for the fast download API
-        let mut last_error = None;
+        self.ensure_authenticated().await?;
+        let auth_domain = self.authenticated_domain().ok_or(Error::AllDomainsFailed {
+            message: "No authenticated domain available".to_string(),
+        })?;
 
-        for domain in DOMAINS {
-            let url = format!(
-                "https://{domain}/dyn/api/fast_download.json?md5={md5}&path_index={path_idx}&domain_index={domain_idx}&key={api_key}"
-            );
+        self.check_domain_available(auth_domain).await?;
 
-            let response = match self.client.get(&url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(Error::Network(e));
-                    continue;
-                }
-            };
+        let url = format!(
+            "https://{auth_domain}/dyn/api/fast_download.json?md5={md5}&path_index={path_idx}&domain_index={domain_idx}&key={api_key}"
+        );
 
-            if !response.status().is_success() {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-
-                // Check for common API errors
-                if body.contains("no_membership") {
-                    return Err(Error::Api {
-                        message: "No active membership for this API key".to_string(),
-                    });
-                }
-                if body.contains("invalid") {
-                    return Err(Error::Api {
-                        message: "Invalid API key".to_string(),
-                    });
-                }
-
-                last_error = Some(Error::Http { status });
-                continue;
-            }
-
-            #[derive(serde::Deserialize)]
-            struct ApiResponse {
-                download_url: Option<String>,
-                error: Option<String>,
-            }
-
-            let api_response: ApiResponse = match response.json().await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = Some(Error::Network(e));
-                    continue;
-                }
-            };
-
-            if let Some(error) = api_response.error {
-                return Err(Error::Api { message: error });
-            }
-
-            let download_url = api_response.download_url.ok_or(Error::Api {
-                message: "No download URL in response".to_string(),
-            })?;
-
-            return Ok(DownloadInfo { download_url });
+        if !self.is_allowed_url(&url) {
+            return Err(Error::DomainNotAllowed(auth_domain.to_string()));
         }
 
-        Err(last_error.unwrap_or(Error::AllDomainsFailed {
-            message: "Failed to get download URL from any domain".to_string(),
-        }))
+        let response = self.client.get(&url).send().await.map_err(Error::from_reqwest)?;
+
+        if response.status().as_u16() == 403 || response.status().as_u16() == 429 {
+            self.record_auth_failure(auth_domain, Some(&response)).await;
+        }
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+
+            if body.contains("no_membership") {
+                return Err(Error::Api {
+                    message: "No active membership for this API key".to_string(),
+                });
+            }
+            if body.contains("invalid") {
+                return Err(Error::Api {
+                    message: "Invalid API key".to_string(),
+                });
+            }
+
+            return Err(Error::Http { status });
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ApiResponse {
+            download_url: Option<String>,
+            error: Option<String>,
+        }
+
+        let api_response: ApiResponse = response.json().await.map_err(Error::from_reqwest)?;
+
+        if let Some(error) = api_response.error {
+            return Err(Error::Api { message: error });
+        }
+
+        let download_url = api_response.download_url.ok_or(Error::Api {
+            message: "No download URL in response".to_string(),
+        })?;
+
+        Ok(DownloadInfo { download_url })
     }
 }
 
-/// Parse item details from the JSON API response
 fn parse_json_details(json_str: &str, md5: &str) -> Result<ItemDetails, Error> {
-    // The response is a JSON string that might be double-encoded
     let json_str = json_str.trim();
     let json_str = if json_str.starts_with('"') && json_str.ends_with('"') {
-        // Double-encoded JSON string, parse first to get the inner JSON
         serde_json::from_str::<String>(json_str).map_err(|e| Error::Parse {
             message: format!("Failed to parse outer JSON: {e}"),
         })?
@@ -271,14 +483,12 @@ fn parse_json_details(json_str: &str, md5: &str) -> Result<ItemDetails, Error> {
         message: format!("Failed to parse JSON: {e}"),
     })?;
 
-    // Check for error response
     if let Some(error) = data.get("error").and_then(|v| v.as_str()) {
         return Err(Error::Api {
             message: error.to_string(),
         });
     }
 
-    // Extract file_unified_data which contains the main metadata
     let file_data = data.get("file_unified_data").ok_or_else(|| Error::Parse {
         message: "Missing file_unified_data".to_string(),
     })?;
@@ -372,20 +582,16 @@ fn parse_json_details(json_str: &str, md5: &str) -> Result<ItemDetails, Error> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    // Parse identifiers from identifiers_unified
     let identifiers = parse_identifiers(file_data.get("identifiers_unified"));
 
-    // Parse categories from classifications_unified
     let categories = parse_string_list_from_object(file_data.get("classifications_unified"));
 
-    // Parse subjects (openlib_subject, etc.)
     let subjects = parse_string_list_from_object(
         file_data
             .get("classifications_unified")
             .and_then(|c| c.get("collection")),
     )
     .or_else(|| {
-        // Fallback to any subject-like classification
         file_data
             .get("classifications_unified")
             .and_then(|c| c.as_object())
@@ -402,10 +608,8 @@ fn parse_json_details(json_str: &str, md5: &str) -> Result<ItemDetails, Error> {
             })
     });
 
-    // Parse IPFS CIDs
     let ipfs_cids = parse_ipfs_infos(file_data.get("ipfs_infos"));
 
-    // Parse additional data for download sources and torrent paths
     let additional = data.get("additional");
 
     let download_sources = parse_download_sources(additional);
@@ -438,7 +642,6 @@ fn parse_json_details(json_str: &str, md5: &str) -> Result<ItemDetails, Error> {
     })
 }
 
-/// Parse identifiers from identifiers_unified object
 fn parse_identifiers(value: Option<&serde_json::Value>) -> Option<Identifiers> {
     let obj = value?.as_object()?;
 
@@ -475,7 +678,6 @@ fn parse_identifiers(value: Option<&serde_json::Value>) -> Option<Identifiers> {
         amazon: get_string_array("amazon"),
     };
 
-    // Only return Some if at least one field is set
     if identifiers.isbn10.is_some()
         || identifiers.isbn13.is_some()
         || identifiers.doi.is_some()
@@ -491,13 +693,11 @@ fn parse_identifiers(value: Option<&serde_json::Value>) -> Option<Identifiers> {
     }
 }
 
-/// Parse a list of strings from an object's values
 fn parse_string_list_from_object(value: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let obj = value?.as_object()?;
     let mut result = Vec::new();
 
     for (key, val) in obj {
-        // Skip certain keys that aren't useful categories
         if key == "collection" || key.starts_with('_') {
             continue;
         }
@@ -520,7 +720,6 @@ fn parse_string_list_from_object(value: Option<&serde_json::Value>) -> Option<Ve
     }
 }
 
-/// Parse IPFS info from ipfs_infos array
 fn parse_ipfs_infos(value: Option<&serde_json::Value>) -> Option<Vec<IpfsInfo>> {
     let arr = value?.as_array()?;
     let infos: Vec<IpfsInfo> = arr
@@ -540,12 +739,10 @@ fn parse_ipfs_infos(value: Option<&serde_json::Value>) -> Option<Vec<IpfsInfo>> 
     if infos.is_empty() { None } else { Some(infos) }
 }
 
-/// Parse download sources from additional data
 fn parse_download_sources(additional: Option<&serde_json::Value>) -> Option<Vec<DownloadSource>> {
     let obj = additional?.as_object()?;
     let mut sources = Vec::new();
 
-    // Check for direct download URLs
     if let Some(urls) = obj.get("download_urls").and_then(|v| v.as_array()) {
         for url in urls {
             if let Some(url_str) = url.as_str() {
@@ -557,7 +754,6 @@ fn parse_download_sources(additional: Option<&serde_json::Value>) -> Option<Vec<
         }
     }
 
-    // Check for IPFS URLs
     if let Some(urls) = obj.get("ipfs_urls").and_then(|v| v.as_array()) {
         for url in urls {
             if let Some(url_str) = url.as_str() {
@@ -576,7 +772,6 @@ fn parse_download_sources(additional: Option<&serde_json::Value>) -> Option<Vec<
     }
 }
 
-/// Parse torrent paths from additional data
 fn parse_torrent_paths(additional: Option<&serde_json::Value>) -> Option<Vec<String>> {
     let arr = additional?.as_object()?.get("torrent_paths")?.as_array()?;
 

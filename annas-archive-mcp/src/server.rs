@@ -15,14 +15,36 @@ use crate::tools::{DetailsParams, DownloadParams, SearchParams};
 #[derive(Clone)]
 pub struct AnnasArchiveServer {
     client: Arc<AnnasArchiveClient>,
-    #[allow(dead_code)] // Used by #[tool_router] macro
+    api_key_for_sanitize: Option<String>,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
+fn sanitize_output(text: &str, key: &Option<String>) -> String {
+    let Some(key) = key else {
+        return text.to_string();
+    };
+    if key.len() < 5 {
+        return text.to_string();
+    }
+    text.replace(key.as_str(), "[REDACTED]")
+}
+
+fn sanitized_error(e: impl std::fmt::Display, key: &Option<String>) -> CallToolResult {
+    let msg = sanitize_output(&e.to_string(), key);
+    CallToolResult::error(vec![Content::text(msg)])
+}
+
+fn sanitized_success(json: String, key: &Option<String>) -> CallToolResult {
+    let msg = sanitize_output(&json, key);
+    CallToolResult::success(vec![Content::text(msg)])
+}
+
 impl AnnasArchiveServer {
-    pub fn new(api_key: Option<String>) -> Self {
+    pub fn new(api_key: Option<String>, domains: Option<Vec<String>>) -> Self {
         Self {
-            client: Arc::new(AnnasArchiveClient::new(api_key)),
+            client: Arc::new(AnnasArchiveClient::new(api_key.clone(), domains)),
+            api_key_for_sanitize: api_key,
             tool_router: Self::tool_router(),
         }
     }
@@ -63,11 +85,12 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&response).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(sanitized_success(json, &self.api_key_for_sanitize))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Search failed: {e}"
-            ))])),
+            Err(e) => Ok(sanitized_error(
+                format!("Search failed: {e}"),
+                &self.api_key_for_sanitize,
+            )),
         }
     }
 
@@ -81,11 +104,12 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&details).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(sanitized_success(json, &self.api_key_for_sanitize))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to get details: {e}"
-            ))])),
+            Err(e) => Ok(sanitized_error(
+                format!("Failed to get details: {e}"),
+                &self.api_key_for_sanitize,
+            )),
         }
     }
 
@@ -105,11 +129,12 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&info).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(sanitized_success(json, &self.api_key_for_sanitize))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to get download URL: {e}"
-            ))])),
+            Err(e) => Ok(sanitized_error(
+                format!("Failed to get download URL: {e}"),
+                &self.api_key_for_sanitize,
+            )),
         }
     }
 }
