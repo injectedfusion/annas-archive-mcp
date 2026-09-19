@@ -106,6 +106,7 @@ fn validate_api_key(key: &str) {
 
 pub struct AnnasArchiveClient {
     client: Client,
+    search_client: Client,
     api_key: Option<String>,
     domains: Vec<String>,
     #[allow(dead_code)]
@@ -121,6 +122,20 @@ impl AnnasArchiveClient {
         }
 
         let cookie_jar = Arc::new(Jar::default());
+        let resolved_domains = resolve_domains(domains);
+
+        let allowed = resolved_domains.clone();
+        let search_redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.stop();
+            }
+            let next_host = attempt.url().host_str().unwrap_or("");
+            if allowed.iter().any(|d| d == next_host) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
 
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
@@ -129,7 +144,13 @@ impl AnnasArchiveClient {
             .build()
             .expect("Failed to create HTTP client");
 
-        let resolved_domains = resolve_domains(domains);
+        let search_client = Client::builder()
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .cookie_provider(cookie_jar.clone())
+            .redirect(search_redirect_policy)
+            .build()
+            .expect("Failed to create search HTTP client");
+
         let domain_states: HashMap<String, DomainState> = resolved_domains
             .iter()
             .map(|d| (d.clone(), DomainState::new()))
@@ -137,6 +158,7 @@ impl AnnasArchiveClient {
 
         Self {
             client,
+            search_client,
             api_key,
             domains: resolved_domains,
             cookie_jar,
@@ -275,7 +297,7 @@ impl AnnasArchiveClient {
                 continue;
             }
 
-            match self.client.get(&url).send().await {
+            match self.search_client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
                         return response.text().await.map_err(Error::from_reqwest);
