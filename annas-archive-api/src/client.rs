@@ -99,8 +99,8 @@ fn validate_api_key(key: &str) {
         trimmed.len()
     );
     assert!(
-        trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
-        "ANNAS_ARCHIVE_API_KEY contains invalid characters (only alphanumeric, hyphens, underscores allowed)"
+        trimmed.chars().all(|c| c.is_ascii_graphic()),
+        "ANNAS_ARCHIVE_API_KEY contains invalid characters (only printable ASCII allowed, no whitespace or control chars)"
     );
 }
 
