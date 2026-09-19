@@ -1,0 +1,40 @@
+package:
+  name: annas-archive-mcp
+  version: 0.2.0
+  epoch: 0
+  description: Security-hardened MCP server for Anna's Archive search
+  target-architecture:
+    - aarch64
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    repositories:
+      - https://packages.wolfi.dev/os
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    packages:
+      - wolfi-baselayout
+      - ca-certificates-bundle
+      - busybox
+      - rust
+      - cargo
+      - build-base
+      - cmake
+      - openssl-dev
+      - perl
+
+pipeline:
+  - name: "Build release binary"
+    runs: |
+      set -e
+      cargo build --release
+      mkdir -p ${{targets.destdir}}/usr/local/bin
+      cp target/release/annas-archive-mcp ${{targets.destdir}}/usr/local/bin/
+      chmod +x ${{targets.destdir}}/usr/local/bin/annas-archive-mcp
+
+  - uses: strip

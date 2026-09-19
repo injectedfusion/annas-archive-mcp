@@ -1,0 +1,35 @@
+contents:
+  repositories:
+    - https://packages.wolfi.dev/os
+    - '@local packages'
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  packages:
+    - wolfi-baselayout
+    - ca-certificates-bundle
+    - annas-archive-mcp@local
+
+archs:
+  - aarch64
+
+accounts:
+  users:
+    - username: mcp
+      uid: 65532
+  groups:
+    - groupname: mcp
+      gid: 65532
+  run-as: mcp
+
+entrypoint:
+  command: /usr/local/bin/annas-archive-mcp
+
+environment:
+  PATH: /usr/local/bin:/usr/bin:/bin
+
+annotations:
+  org.opencontainers.image.title: "Anna's Archive MCP Server"
+  org.opencontainers.image.description: "Security-hardened MCP server for Anna's Archive search"
+  org.opencontainers.image.vendor: "injectedfusion"
+  org.opencontainers.image.licenses: "MIT"
+  org.opencontainers.image.source: "https://github.com/injectedfusion/annas-archive-mcp"
